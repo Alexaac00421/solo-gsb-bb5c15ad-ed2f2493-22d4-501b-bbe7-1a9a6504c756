@@ -21,6 +21,10 @@ const state = {
     result: null,
     kind: null,
     stale: false
+  },
+  spof: {
+    excluded: new Set(), // 被取消勾选的许可编号(默认全选 = 检查全部有效许可)
+    report: null         // 最近一次单点挂牌失效风险报告(含所依据 revision)
   }
 };
 
@@ -1012,6 +1016,124 @@ async function groupConfirm() {
 }
 
 // ---------------------------------------------------------------------------
+// 单点挂牌失效风险报告(只读): 假设单个已挂牌开关失效, 哪些有效许可会失去隔离
+// ---------------------------------------------------------------------------
+function renderSpofPermits() {
+  const box = $('spofPermits');
+  if (!box) return;
+  const snap = state.snapshot;
+  if (!snap) return;
+  if (!snap.permits.length) {
+    box.innerHTML = '<p class="hint">当前没有有效检修许可；生成报告将返回空报告。</p>';
+    return;
+  }
+  box.innerHTML = snap.permits.map((p) => `<label class="device-check has-permit">
+    <input type="checkbox" data-spof-permit="${p.id}"
+      ${state.spof.excluded.has(p.id) ? '' : 'checked'}>
+    <span><b>许可 #${p.id} · ${escapeHtml(p.device_name)}</b>
+      <small>申请人 ${escapeHtml(p.requested_by)} · 设备 #${p.device_id}</small></span>
+  </label>`).join('');
+  box.querySelectorAll('[data-spof-permit]').forEach((input) => {
+    input.addEventListener('change', () => {
+      const id = parseInt(input.dataset.spofPermit, 10);
+      if (input.checked) state.spof.excluded.delete(id);
+      else state.spof.excluded.add(id);
+    });
+  });
+}
+
+async function spofRun() {
+  const snap = state.snapshot;
+  if (!snap) return;
+  const selected = snap.permits.map((p) => p.id).filter((id) => !state.spof.excluded.has(id));
+  // 全部勾选时省略 permit_ids(= 检查全部有效许可); 否则携带显式编号集合。
+  // 显式空组会被服务器拒绝(400), 这里提前提示。
+  if (snap.permits.length > 0 && selected.length === 0) {
+    return toast('请至少勾选一张有效许可；显式空组会被服务器拒绝。', 'error');
+  }
+  const body = selected.length === snap.permits.length ? {} : { permit_ids: selected };
+  const r = await fetch('/api/spof/report', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    return toast(`✖ ${data.error ? data.error.message : '风险报告请求失败'}`, 'error');
+  }
+  state.spof.report = data;
+  renderSpofReport();
+  if (data.permitCount === 0) {
+    toast(`当前无有效许可，返回空报告（修订号 ${data.revision}）。`, 'info');
+  } else {
+    toast(data.riskCount > 0
+      ? `发现 ${data.riskCount} 项单点挂牌失效风险（基于修订号 ${data.revision}，只读未改变任何状态）。`
+      : `未发现单点挂牌失效风险（基于修订号 ${data.revision}，只读未改变任何状态）。`,
+      data.riskCount > 0 ? 'error' : 'success');
+  }
+}
+
+function renderSpofReport() {
+  const box = $('spofReport');
+  if (!box) return;
+  const rep = state.spof.report;
+  if (!rep) {
+    box.innerHTML = '<p class="hint">勾选要检查的许可（默认全部），点击“生成风险报告”。'
+      + '每个已挂牌开关都会列出：若它单独失效，哪些许可会失去隔离及一条真实带电路径。</p>';
+    return;
+  }
+  const curRev = state.snapshot ? state.snapshot.revision : rep.revision;
+  const stale = curRev !== rep.revision
+    ? `<div class="advice-stale">⚠ 状态已变化：报告基于修订号 ${rep.revision}，当前为 ${curRev}。
+        报告不会自动更新，请重新生成。</div>` : '';
+
+  if (rep.permitCount === 0) {
+    box.innerHTML = stale + `<div class="spof-card ok">当前无有效检修许可 —— 空报告（修订号 ${rep.revision}）。</div>`;
+    return;
+  }
+
+  const head = `<div class="order-head ${rep.riskCount ? 'bad' : 'ok'}">
+    ${rep.riskCount ? `✖ 发现 ${rep.riskCount} 项单点挂牌失效风险` : '✔ 未发现单点挂牌失效风险'}
+    <div class="hint">检查许可 ${rep.permitCount} 张 · 已挂牌开关 ${rep.switchCount} 个 ·
+      基于修订号 ${rep.revision}（同一次状态快照；完整可达性判定，不受诊断展示上限影响）</div>
+  </div>`;
+
+  const cards = rep.switches.map((sw) => {
+    const meta = `<span class="hint">（${sw.open_pos ? '分闸' : '合闸'} · 🔒挂牌中）</span>`;
+    if (sw.riskCount === 0) {
+      return `<div class="spof-card ok"><b>#${sw.node_id} ${escapeHtml(sw.name)}</b> ${meta}
+        <div>✔ 无单点风险：假设该开关失效，所查许可仍全部保持隔离。</div></div>`;
+    }
+    const risks = sw.risks.map((risk, i) => `<div class="spof-risk">
+      <b>许可 #${risk.permit_id}（${escapeHtml(risk.device_name)}）将失去隔离</b>
+      <div class="path-line">假设失效后带电：${risk.livePath.nodes
+        .map((n) => (n.tagged ? `🔒${escapeHtml(n.name)}` : escapeHtml(n.name))).join(' → ')}</div>
+      <button class="btn btn-sm btn-warn" data-spof-highlight="${sw.node_id}:${i}">在供电网络图中高亮</button>
+    </div>`).join('');
+    return `<div class="spof-card bad"><b>#${sw.node_id} ${escapeHtml(sw.name)}</b> ${meta}
+      <div>✖ ${sw.riskCount} 项风险：假设该开关不再阻断供电，以下许可出现未切断通路：</div>
+      ${risks}</div>`;
+  }).join('');
+
+  box.innerHTML = stale + head + cards;
+  box.querySelectorAll('[data-spof-highlight]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const [swId, idx] = btn.dataset.spofHighlight.split(':').map((x) => parseInt(x, 10));
+      const sw = state.spof.report && state.spof.report.switches.find((s) => s.node_id === swId);
+      const risk = sw && sw.risks[idx];
+      if (!risk) return;
+      state.highlightPaths = [risk.livePath.nodes.map((n) => n.id)];
+      document.querySelectorAll('.tab').forEach((x) =>
+        x.classList.toggle('active', x.dataset.tab === 'network'));
+      document.querySelectorAll('.tabpane').forEach((x) =>
+        x.classList.toggle('active', x.id === 'tab-network'));
+      renderGraph();
+      toast(`已高亮：假设 #${swId} ${sw.name} 失效后，许可 #${risk.permit_id} 的带电路径。`, 'info');
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // 渲染: 管理页
 // ---------------------------------------------------------------------------
 function renderAdmin() {
@@ -1094,6 +1216,8 @@ function render() {
   renderGroupResult();
   renderOrderEditor();
   renderOrderAdvice();
+  renderSpofPermits();
+  renderSpofReport();
 }
 
 function toast(message, kind) {
@@ -1213,6 +1337,17 @@ $('orderGrid').addEventListener('click', (ev) => {
 });
 $('orderPreviewBtn').addEventListener('click', orderPreview);
 $('orderConfirmBtn').addEventListener('click', orderConfirm);
+
+// 单点挂牌失效风险报告事件(只读, 无需身份)
+$('spofRunBtn').addEventListener('click', spofRun);
+$('spofAllBtn').addEventListener('click', () => {
+  state.spof.excluded.clear();
+  renderSpofPermits();
+});
+$('spofNoneBtn').addEventListener('click', () => {
+  (state.snapshot ? state.snapshot.permits : []).forEach((p) => state.spof.excluded.add(p.id));
+  renderSpofPermits();
+});
 $('groupPlanBtn').addEventListener('click', groupPlan);
 $('groupPreviewBtn').addEventListener('click', groupPreview);
 $('groupConfirmBtn').addEventListener('click', groupConfirm);

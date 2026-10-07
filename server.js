@@ -17,6 +17,7 @@ const {
   MAX_STEPS: MAX_ORDER_STEPS
 } = require('./src/orders');
 const { planIsolation, planGroupIsolation } = require('./src/advisor');
+const { buildSpofReport } = require('./src/spof');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const DB_PATH = process.env.LOTO_DB || path.join(__dirname, 'data', 'loto.db');
@@ -388,6 +389,70 @@ app.post('/api/isolation-group/plan', wrap((req, res) => {
     kind: 'isolationGroup.plan',
     revision,
     ...serializeGroupPlan(graph, plan)
+  });
+}));
+
+// ---------------------------------------------------------------------------
+// 单点挂牌失效风险报告 —— 只读诊断
+// ---------------------------------------------------------------------------
+
+// 许可编号筛选: 省略 -> 检查全部有效许可; 显式空组 / 重复 / 非正整数 / 非有效许可 -> 拒绝。
+function parseSpofPermitIds(raw, permits) {
+  if (raw === undefined || raw === null) return permits;
+  if (!Array.isArray(raw) || raw.length === 0) {
+    throw new ApiError(400, 'PERMIT_IDS_REQUIRED',
+      'permit_ids 必须是非空的许可编号数组; 省略该字段表示检查全部有效许可');
+  }
+  const ids = [];
+  for (const value of raw) {
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
+      throw new ApiError(400, 'INVALID_PERMIT_ID', `许可编号无效(须为正整数): ${JSON.stringify(value)}`);
+    }
+    ids.push(value);
+  }
+  const duplicates = [...new Set(ids.filter((id, i) => ids.indexOf(id) !== i))];
+  if (duplicates.length > 0) {
+    throw new ApiError(400, 'PERMIT_IDS_DUPLICATE',
+      `许可编号集合不能重复: ${duplicates.join(', ')}`, { duplicate_ids: duplicates });
+  }
+  const byId = new Map(permits.map((p) => [p.id, p]));
+  const invalid = ids.filter((id) => !byId.has(id));
+  if (invalid.length > 0) {
+    throw new ApiError(404, 'PERMIT_NOT_FOUND',
+      `许可编号不存在或已结束(仅检查有效许可): ${invalid.join(', ')}`,
+      { invalid_permit_ids: invalid });
+  }
+  return ids.map((id) => byId.get(id));
+}
+
+// 单点挂牌失效风险报告(只读): 对每个当前已挂牌开关分别假设它不再阻断供电,
+// 其余开关与供电图保持原状, 用完整可达性分析判断哪些所查许可会出现未切断通路。
+// 图 / 许可 / 修订号在同一次同步读取中取得(单线程同步执行, 即同一次当前状态快照);
+// 不改变开关、许可、修订号或审计。
+app.post('/api/spof/report', wrap((req, res) => {
+  const graph = loadGraph();
+  const permits = activePermits();
+  const revision = currentRevision();
+  const checked = parseSpofPermitIds(req.body?.permit_ids, permits);
+
+  const base = { ok: true, kind: 'spof.report', revision };
+  if (checked.length === 0) {
+    // 无有效许可 -> 空报告
+    return res.json({
+      ...base,
+      permit_ids: [], permitCount: 0, switchCount: 0, riskCount: 0, switches: []
+    });
+  }
+
+  const report = buildSpofReport(graph, checked);
+  res.json({
+    ...base,
+    permit_ids: checked.map((p) => p.id).sort((a, b) => a - b),
+    permitCount: checked.length,
+    switchCount: report.switches.length,
+    riskCount: report.riskCount,
+    // 按开关编号、许可编号稳定排序; 未影响任何所查许可的已挂牌开关同样列出(risks 为空)
+    switches: report.switches
   });
 }));
 
@@ -837,6 +902,7 @@ app.use((err, req, res, next) => {
     if (err.current) body.current = err.current;
     if (err.duplicate_ids) body.duplicate_ids = err.duplicate_ids;
     if (err.invalid_device_ids) body.invalid_device_ids = err.invalid_device_ids;
+    if (err.invalid_permit_ids) body.invalid_permit_ids = err.invalid_permit_ids;
     if (err.violations) body.violations = err.violations;
     if (err.livePaths) body.livePaths = err.livePaths;
     if (err.conflicts) body.conflicts = err.conflicts;

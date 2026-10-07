@@ -67,6 +67,20 @@
         </div>
         <p class="hint">仅当所有启用电源到目标设备的供电路径都经过已挂牌开关时，许可才生效。申请失败将列出未切断路径。</p>
       </div>
+      <div class="panel" id="spofPanel">
+        <h3>单点挂牌失效风险（假设单个挂牌失效）</h3>
+        <p class="hint">对每一个当前已挂牌开关，分别假设它不再阻断供电（其余开关与供电图保持原状），
+          按完整可达性规则判断哪些有效许可会重新出现未切断通路，并给出一条真实带电路径。
+          报告基于同一次当前状态快照（携带修订号），不受诊断路径展示上限影响；
+          只读：不改变开关、许可、修订号或审计。默认检查全部有效许可，可勾选筛选。</p>
+        <div id="spofPermits" class="device-check-grid"></div>
+        <div class="form-row" style="margin-top:10px">
+          <button id="spofRunBtn" class="btn btn-primary">生成风险报告</button>
+          <button id="spofAllBtn" class="btn">全选</button>
+          <button id="spofNoneBtn" class="btn">清空选择</button>
+        </div>
+        <div id="spofReport" class="spof-report"></div>
+      </div>
     </section>
 
     <!-- 临时操作单 -->

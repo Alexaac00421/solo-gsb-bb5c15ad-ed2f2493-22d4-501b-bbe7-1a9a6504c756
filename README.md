@@ -142,6 +142,24 @@ HTTP API）临时编排一张操作单：
   `withinOrderLimit:false`；整组确认返回 `400 STEPS_TOO_LONG`，不可部分执行。
 - 旧的单设备建议、临时操作单和许可接口路径与行为保持兼容；新接口是叠加能力。
 
+### 单点挂牌失效风险报告（SPOF）
+操作员在“检修许可”页（或调用 HTTP API）可查看**有效许可的单点挂牌失效风险**：
+对每一个当前已挂牌开关，分别假设它不再阻断供电（其余开关及供电图保持原状），
+按现有**完整可达性规则**判断哪些有效许可会重新出现未切断通路。
+
+- `POST /api/spof/report` 为**只读**接口：可选 `permit_ids` 筛选要检查的许可；
+  **省略时检查全部有效许可**。显式空组、重复编号、非正整数或非数字编号返回 `400`，
+  引用不存在或已结束的许可编号返回 `404`（附 `invalid_permit_ids`）。
+- 结果按**开关编号、许可编号稳定排序**；每项风险附一条**真实带电路径**
+  （完整可达性分析的 BFS 见证路径，**不受诊断路径展示上限影响**，可超过 64 节点）。
+- **未影响任何所查许可的已挂牌开关也须列出**（`risks` 为空，即无单点风险）；
+  **无有效许可时返回空报告**（`switches` 为空）。
+- 整份报告基于**同一次当前状态快照**（图、许可、修订号在同一次同步读取中取得），
+  响应携带所依据的 `revision`；报告**不改变开关、许可、修订号或审计**。
+- 浏览器“检修许可”页可勾选筛选许可（默认全部）、生成报告，并点击
+  “在供电网络图中高亮”查看每条风险路径；状态被他人推进后旧报告会提示已过期，
+  需重新生成，不会自动更新。
+
 ### 多人并发（乐观锁）
 - 每次成功变更都会让全局 **修订号 revision + 1**（界面右上角实时显示）。
 - 所有写操作必须携带操作者“所见”的 `revision`。
@@ -230,7 +248,10 @@ cp .env.example .env
 4. **检修许可** 页：选择设备申请许可；申请失败时弹窗列出至少一条未切断路径；
    路径数量 / 长度超过诊断上限时，弹窗与许可卡片会用黄色提示标记“仅展示部分
    路径”，但拒绝结论基于完整可达性分析，不受上限影响。有效许可卡片实时显示
-   隔离是否满足，可随时结束许可。
+   隔离是否满足，可随时结束许可。页面下方“单点挂牌失效风险”面板可勾选筛选
+   许可（默认全部）并生成报告：逐个已挂牌开关假设其失效，红色条目列出将失去
+   隔离的许可与一条真实带电路径（可点击在供电网络图中高亮），绿色条目为
+   无单点风险；报告携带所依据修订号，状态变化后需重新生成。
 5. **拓扑管理** 页（管理员）：维护节点和有向供电关系。
    规则：电源只能作起点、设备只能作终点、不允许自环和重复接线。
 6. **变更记录** 页：查看所有成功变更的时间、操作者、动作、前后修订号，
@@ -263,6 +284,7 @@ cp .env.example .env
 | POST | `/api/isolation-group/plan` | - | **多设备协同方案**（只读）`{device_ids:[...]}`：返回共用开关、必要分闸挂牌步骤、许可数、总步数和所据修订号；任一目标无开关可切断时 `422` |
 | POST | `/api/isolation-group/preview` | operator | 多设备协同方案**预演**（只读，不校验/改变修订号）`{device_ids:[...]}` |
 | POST | `/api/isolation-group/confirm` | operator | 多设备协同隔离与全部许可**一次确认**（原子，revision +1，一条审计）`{device_ids:[...]}` |
+| POST | `/api/spof/report` | - | **单点挂牌失效风险报告**（只读）`{permit_ids?:[...]}`：逐一举牌开关假设失效，列出会失去隔离的有效许可与真实带电路径；省略 `permit_ids` 检查全部有效许可 |
 | GET | `/api/audit?limit=100` | - | 变更记录（含前后状态快照） |
 | POST | `/api/admin/nodes` | admin | 新增节点 `{kind, name}` |
 | PATCH | `/api/admin/nodes/:id` | admin | 改名 / 启用停用电源 `{name?, enabled?}` |
@@ -445,6 +467,59 @@ curl -s -X POST http://localhost:3000/api/isolation-group/confirm \
 共用开关、每台目标由哪些新增挂牌点保护、分闸挂牌步数、许可数、确认总步数和所据
 修订号；状态被他人推进时旧方案标记为 **STALE**，不会自动替换。
 
+#### 单点挂牌失效风险报告 API 示例
+
+```bash
+# 前置: 演示网络中 K1(id=3)、K2(id=4) 已分闸挂牌, 许可 #1(1#循环水泵) 有效
+
+# 1) 全量报告: 省略 permit_ids 检查全部有效许可(只读, 无需 actor/role/revision)
+curl -s -X POST http://localhost:3000/api/spof/report \
+  -H 'Content-Type: application/json' -d '{}'
+# -> 200 {
+#   ok:true, kind:"spof.report", revision:6,
+#   permit_ids:[1], permitCount:1, switchCount:2, riskCount:2,
+#   switches:[
+#     { node_id:3, name:"进线开关K1", open_pos:true, tagged:true, riskCount:1,
+#       risks:[{ permit_id:1, device_id:6, device_name:"1#循环水泵",
+#         livePath:{ nodes:[{id:1,kind:"source",name:"1#主电源",...},
+#                           {id:3,kind:"switch",name:"进线开关K1",...},
+#                           {id:5,kind:"switch",name:"联络开关K3",...},
+#                           {id:6,kind:"device",name:"1#循环水泵",...}],
+#                    edges:[1,3,5] } }]},
+#     { node_id:4, name:"备用开关K2", ..., risks:[{ permit_id:1, ...,
+#         livePath:{ nodes:[2#备用电源 -> K2 -> K3 -> 1#循环水泵], edges:[2,4,5] } }]}
+#   ]
+# }
+# 每个已挂牌开关一项: 假设它单独失效, 哪些许可会失去隔离 + 一条真实带电路径;
+# 无风险的开关 risks 为空(无单点风险), 同样列出。
+
+# 2) 许可筛选: 只检查许可 #1、#2(响应中编号升序)
+curl -s -X POST http://localhost:3000/api/spof/report \
+  -H 'Content-Type: application/json' -d '{"permit_ids":[2,1]}'
+
+# 3) 筛选集合校验
+#    显式空组        -> 400 PERMIT_IDS_REQUIRED
+#    重复编号        -> 400 PERMIT_IDS_DUPLICATE (附 duplicate_ids)
+#    非正整数/非数字 -> 400 INVALID_PERMIT_ID
+#    不存在或已结束  -> 404 PERMIT_NOT_FOUND (附 invalid_permit_ids)
+curl -s -X POST http://localhost:3000/api/spof/report \
+  -H 'Content-Type: application/json' -d '{"permit_ids":[]}'
+# -> 400 { ok:false, error:{code:"PERMIT_IDS_REQUIRED", ...}, revision:6 }
+
+# 4) 无有效许可时 -> 空报告
+# -> 200 { ok:true, kind:"spof.report", revision:6, permit_ids:[],
+#          permitCount:0, switchCount:0, riskCount:0, switches:[] }
+
+# 报告为只读: 不推进修订号、不写审计、不改变开关与许可;
+# 判定走完整可达性分析, 不受诊断路径 200 条 / 64 节点展示上限影响。
+```
+
+浏览器中的用法：进入“检修许可”页的“单点挂牌失效风险”面板，默认勾选全部有效
+许可（可取消勾选进行筛选），点击“生成风险报告”。报告按开关列出：绿色为
+“无单点风险”，红色列出该开关失效后将失去隔离的许可及一条真实带电路径，
+点击“在供电网络图中高亮”可跳转查看该路径。报告头部显示所依据的修订号；
+状态被他人推进后报告提示已过期，需重新生成。
+
 ## 目录结构
 
 ```
@@ -458,6 +533,7 @@ curl -s -X POST http://localhost:3000/api/isolation-group/confirm \
 │   ├── graph.js            # 完整可达性隔离判定(无上限) + 限量诊断路径枚举
 │   ├── advisor.js          # 单设备/多设备隔离建议: 最小新增挂牌点割(拆点 + Dinic)
 │   ├── orders.js           # 临时操作单: 结构校验 + 纯内存预演 + 按序原子提交
+│   ├── spof.js             # 单点挂牌失效风险分析(假设单个挂牌失效的完整可达性判定)
 │   └── init-db.js          # 建库脚本(npm run init-db)
 ├── public/                 # 浏览器界面(原生 JS + SVG)
 │   ├── index.html
@@ -468,7 +544,9 @@ curl -s -X POST http://localhost:3000/api/isolation-group/confirm \
     ├── orders.e2e.js       # 临时操作单预演/确认/原子回滚/STALE_REVISION 的 HTTP 回归
     ├── advice.e2e.js       # 单设备隔离建议最少挂牌/空步骤/不可行/建议带入单据/409 回归
     ├── group.e2e.js        # 多设备协同方案/预演/一次确认/重复许可/不可行/单审计回归
+    ├── spof.e2e.js         # 单点挂牌失效风险报告筛选校验/排序/真实路径/只读/空报告回归
     ├── advisor.test.js     # 单/多设备隔离建议单元测试(最小割、共用开关、无开关旁路等)
+    ├── spof.test.js        # 单点挂牌失效风险单元测试(冗余挂牌、筛选、超长链路、环图等)
     ├── graph.test.js       # 隔离判定单元测试(枚举触顶/超长/环路)
     └── truncation.e2e.js   # 200 条挂牌支路挤掉带电路径的 HTTP 回归(手动)
 ```
@@ -479,6 +557,7 @@ curl -s -X POST http://localhost:3000/api/isolation-group/confirm \
 # 单元测试(无需起服务, 无需数据库)
 npm run test:graph
 npm run test:advisor
+npm run test:spof
 
 # 端到端冒烟(终端1 起服务, 终端2 跑测试; 使用独立 DB 避免污染演示库)
 LOTO_DB=/tmp/loto-test.db PORT=3100 node server.js
@@ -492,6 +571,9 @@ BASE=http://127.0.0.1:3100 node test/advice.e2e.js
 
 # 多设备协同回归(集合校验/共用开关/预演只读/整组许可/重复许可拒绝/不可行路径/单审计)
 BASE=http://127.0.0.1:3100 node test/group.e2e.js
+
+# 单点挂牌失效风险回归(筛选校验/稳定排序/真实路径/冗余挂牌无风险/只读/空报告)
+BASE=http://127.0.0.1:3100 node test/spof.e2e.js
 
 # 枚举触顶回归(同样打到 PORT=3100 的服务; 结束会清理临时拓扑)
 node test/truncation.e2e.js
@@ -516,3 +598,8 @@ node test/smoke.js                            # 终端2
 402 步超限不截断、结果确定性与自定义上限，共 42 项断言；`advice.e2e.js`
 另覆盖建议只读（不改修订号 / 审计）、带入预演确认、确认必须使用建议
 revision 与 409 STALE_REVISION，共 50 项断言。
+`spof.test.js` 覆盖：单点失效判定、串联冗余挂牌无风险、多许可排序、许可子集
+筛选、空许可集空报告、停用电源、>64 节点超长链路见证路径、含环图与输入不可变，
+共 40 项断言；`spof.e2e.js` 覆盖：空报告、筛选集合校验（空组 / 重复 / 非正整数 /
+非数字 / 非数组 / 非有效许可）、开关与许可稳定排序、真实带电路径、报告只读
+（修订号 / 审计 / 状态不变）、冗余挂牌场景与许可结束后空报告，共 74 项断言。
